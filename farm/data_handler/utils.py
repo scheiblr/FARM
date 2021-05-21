@@ -6,6 +6,7 @@ import random
 import tarfile
 import tempfile
 import string
+import uuid
 from contextlib import ExitStack
 from itertools import islice
 from pathlib import Path
@@ -116,7 +117,7 @@ def read_jsonl(file, proxies=None):
     if not (os.path.exists(file)):
         logger.info(f" Couldn't find {file} locally. Trying to download ...")
         _download_extract_downstream_data(file, proxies=proxies)
-    dicts = [json.loads(l) for l in open(file)]
+    dicts = [json.loads(l) for l in open(file, encoding="utf-8")]
     return dicts
 
 def read_ner_file(filename, sep="\t", proxies=None):
@@ -183,6 +184,84 @@ def read_ner_file(filename, sep="\t", proxies=None):
         data.append({"text": " ".join(sentence), "ner_label": label})
     return data
 
+def read_dpr_json(file, max_samples=None, proxies=None, num_hard_negatives=1, num_positives=1, shuffle_negatives=True, shuffle_positives=False):
+    """
+    Reads a Dense Passage Retrieval (DPR) data file in json format and returns a list of dictionaries.
+
+    :param file: filename of DPR data in json format
+
+    Returns:
+        list of dictionaries: List[dict]
+        each dictionary: {
+                    "query": str -> query_text
+                    "passages": List[dictionaries] -> [{"text": document_text, "title": xxx, "label": "positive", "external_id": abb123},
+                                {"text": document_text, "title": xxx, "label": "hard_negative", "external_id": abb134},
+                                ...]
+                    }
+        example:
+                ["query": 'who sings does he love me with reba'
+                "passages" : [{'title': 'Does He Love You',
+                    'text': 'Does He Love You "Does He Love You" is a song written by Sandy Knox and Billy Stritch, and recorded as a duet by American country music artists Reba McEntire and Linda Davis. It was released in August 1993 as the first single from Reba\'s album "Greatest Hits Volume Two". It is one of country music\'s several songs about a love triangle. "Does He Love You" was written in 1982 by Billy Stritch. He recorded it with a trio in which he performed at the time, because he wanted a song that could be sung by the other two members',
+                    'label': 'positive',
+                    'external_id': '11828866'},
+                    {'title': 'When the Nightingale Sings',
+                    'text': "When the Nightingale Sings When The Nightingale Sings is a Middle English poem, author unknown, recorded in the British Library's Harley 2253 manuscript, verse 25. It is a love poem, extolling the beauty and lost love of an unknown maiden. When þe nyhtegale singes þe wodes waxen grene.<br> Lef ant gras ant blosme springes in aueryl y wene,<br> Ant love is to myn herte gon wiþ one spere so kene<br> Nyht ant day my blod hit drynkes myn herte deþ me tene. Ich have loved al þis er þat y may love namore,<br> Ich have siked moni syk lemmon for",
+                    'label': 'hard_negative',
+                    'external_id': '10891637'}]
+                ]
+
+    """
+    # get remote dataset if needed
+    if not (os.path.exists(file)):
+        logger.info(f" Couldn't find {file} locally. Trying to download ...")
+        _download_extract_downstream_data(file, proxies=proxies)
+
+    if file.suffix.lower() == ".jsonl":
+        dicts = []
+        with open(file, encoding='utf-8') as f:
+            for line in f:
+                dicts.append(json.loads(line))
+    else:
+        dicts = json.load(open(file, encoding='utf-8'))
+
+    if max_samples:
+        dicts = random.sample(dicts, min(max_samples, len(dicts)))
+
+    # convert DPR dictionary to standard dictionary
+    query_json_keys = ["question", "questions", "query"]
+    positive_context_json_keys = ["positive_contexts", "positive_ctxs", "positive_context", "positive_ctx"]
+    hard_negative_json_keys = ["hard_negative_contexts", "hard_negative_ctxs", "hard_negative_context", "hard_negative_ctx"]
+    standard_dicts = []
+    for dict in dicts:
+        sample = {}
+        passages = []
+        for key, val in dict.items():
+            if key in query_json_keys:
+                sample["query"] = val
+            elif key in positive_context_json_keys:
+                if shuffle_positives:
+                    random.shuffle(val)
+                for passage in val[:num_positives]:
+                    passages.append({
+                        "title": passage["title"],
+                        "text": passage["text"],
+                        "label": "positive",
+                        "external_id": passage.get("passage_id", uuid.uuid4().hex.upper()[0:8])
+                        })
+            elif key in hard_negative_json_keys:
+                if shuffle_negatives:
+                    random.shuffle(val)
+                for passage in val[:num_hard_negatives]:
+                    passages.append({
+                        "title": passage["title"],
+                        "text": passage["text"],
+                        "label": "hard_negative",
+                        "external_id": passage.get("passage_id", uuid.uuid4().hex.upper()[0:8])
+                        })
+        sample["passages"] = passages
+        standard_dicts.append(sample)
+    return standard_dicts
+
 def _convert_germeval14_labels(tags: List[str]):
     newtags = []
     for tag in tags:
@@ -242,13 +321,13 @@ def write_squad_predictions(predictions, out_filename, predictions_filename=None
         for d in temp["data"]:
             for p in d["paragraphs"]:
                 for q in p["qas"]:
-                    if q["is_impossible"]:
+                    if q.get("is_impossible",False):
                         dev_labels[q["id"]] = "is_impossible"
                     else:
                         dev_labels[q["id"]] = q["answers"][0]["text"]
         not_included = set(list(dev_labels.keys())) - set(list(predictions_json.keys()))
         if len(not_included) > 0:
-            logger.info(f"There were missing predicitons for question ids: {str(set(list(dev_labels.keys())))}")
+            logger.info(f"There were missing predicitons for question ids: {list(not_included)}")
         for x in not_included:
             predictions_json[x] = ""
 
@@ -456,7 +535,7 @@ def _get_random_sentence(all_baskets, forbidden_doc):
     sentence = None
     for _ in range(100):
         rand_doc_idx = random.randrange(len(all_baskets))
-        rand_doc = all_baskets[rand_doc_idx]["doc"]
+        rand_doc = all_baskets[rand_doc_idx]
 
         # check if our picked random doc is really different to our initial doc
         if rand_doc != forbidden_doc:
@@ -468,102 +547,8 @@ def _get_random_sentence(all_baskets, forbidden_doc):
     return sentence
 
 
-def get_sequence_pair(doc, chunk, chunk_clear_text, all_baskets, tokenizer, max_num_tokens, prob_next_sentence=0.5):
-    """
-    Get one sample from corpus consisting of two sequences. A sequence can consist of more than one sentence.
-    With prob. 50% these are two subsequent sequences from one doc. With 50% the second sequence will be a
-    random one from another document.
 
-    :param doc: The current document.
-    :type doc: [str]
-    :param chunk: List of subsequent, tokenized sentences.
-    :type chunk: [dict]
-    :param chunk_clear_text: List of subsequent sentences.
-    :type chunk_clear_text: [str]
-    :param all_baskets: SampleBaskets containing multiple other docs from which we can sample the second sequence
-    if we need a random one.
-    :type all_baskets: [dict]
-    :param tokenizer: Used to split a sentence (str) into tokens.
-    :param max_num_tokens: Samples are truncated after this many tokens.
-    :type max_num_tokens: int
-    :return: (list, list, dict, int)
-        tokenized seq a,
-        tokenized seq b,
-        sample in clear text with label,
-        number of unused sentences in chunk
-    """
-    sequence_a = []
-    sequence_b = []
-    sample_in_clear_text = { "text_a" : "", "text_b" : ""}
-    # determine how many segments from chunk go into sequence_a
-    len_sequence_a = 0
-    a_end = 1
-    if len(chunk) >= 2:
-        a_end = random.randrange(1, len(chunk))
-    for i in range(a_end):
-        sequence_a.append(chunk[i])
-        sample_in_clear_text["text_a"] += f"{chunk_clear_text[i]} "
-        len_sequence_a += len(chunk[i]["tokens"])
-    sample_in_clear_text["text_a"].strip()
-
-    # actual next sequence
-    if (random.random() > prob_next_sentence) and (len(chunk) > 1):
-        label = True
-        for i in range(a_end, len(chunk)):
-            sequence_b.append(chunk[i])
-            sample_in_clear_text["text_b"] += f"{chunk_clear_text[i]} "
-        sample_in_clear_text["text_b"].strip()
-        sample_in_clear_text["nextsentence_label"] = True
-        num_unused_segments = 0
-    # edge case: split sequence in half
-    elif (len(chunk) == 1) and len_sequence_a >= max_num_tokens:
-        sequence_a = {}
-        sequence_b = {}
-        if int(len(chunk[0]["tokens"])/2) >= max_num_tokens:
-            boundary = int(max_num_tokens/2)
-        else:
-            boundary = int(len(chunk[0]["tokens"])/2)
-        sequence_a["tokens"] = chunk[0]["tokens"][:boundary]
-        sequence_a["offsets"] = chunk[0]["offsets"][:boundary]
-        sequence_a["start_of_word"] = chunk[0]["start_of_word"][:boundary]
-        sequence_b["tokens"] = chunk[0]["tokens"][boundary:]
-        sequence_b["start_of_word"] = chunk[0]["start_of_word"][boundary:]
-        # get offsets for sequence_b right
-        seq_b_offset_start = chunk[0]["offsets"][boundary]
-        sequence_b["offsets"] = [offset - seq_b_offset_start for offset in chunk[0]["offsets"][boundary:]]
-        # get clear text
-        clear_text_boundary = chunk[0]["offsets"][boundary]
-        sample_in_clear_text["text_a"] = chunk_clear_text[0][:clear_text_boundary]
-        sample_in_clear_text["text_b"] = chunk_clear_text[0][clear_text_boundary:]
-        sample_in_clear_text["text_a"].strip()
-        sample_in_clear_text["text_b"].strip()
-        sample_in_clear_text["nextsentence_label"] = True
-        return [sequence_a], [sequence_b], sample_in_clear_text, 0
-    # random next sequence
-    else:
-        label = False
-        sequence_b_length = 0
-        target_b_length = max_num_tokens - len_sequence_a
-        random_doc = _get_random_doc(all_baskets, forbidden_doc=doc)
-
-        random_start = random.randrange(len(random_doc))
-        for i in range(random_start, len(random_doc)):
-            current_sentence_tokenized = tokenize_with_metadata(random_doc[i], tokenizer)
-            sequence_b.append(current_sentence_tokenized)
-            sample_in_clear_text["text_b"] += f"{random_doc[i]} "
-            sequence_b_length += len(current_sentence_tokenized["tokens"])
-            if sequence_b_length >= target_b_length:
-                break
-
-        sample_in_clear_text["text_b"].strip()
-        sample_in_clear_text["nextsentence_label"] = False
-
-        # We didn't use all of the segments in chunk => put them back
-        num_unused_segments = len(chunk) - a_end
-
-    assert len(sequence_a) > 0
-    assert len(sequence_b) > 0
-    return sequence_a, sequence_b, sample_in_clear_text, num_unused_segments
+    # return sequence_a, sequence_b, sample_in_clear_text, num_unused_segments
 
 
 def _get_random_doc(all_baskets, forbidden_doc):
@@ -605,88 +590,7 @@ def join_sentences(sequence):
     return sequence_joined
 
 
-def mask_random_words(tokens, vocab, token_groups=None, max_predictions_per_seq=20, masked_lm_prob=0.15):
-    """
-    Masking some random tokens for Language Model task with probabilities as in the original BERT paper.
-    num_masked.
-    If token_groups is supplied, whole word masking is applied, so *all* tokens of a word are either masked or not.
-    This option was added by the BERT authors later and showed solid improvements compared to the original objective.
-    Whole Word Masking means that if we mask all of the wordpieces corresponding to an original word.
-    When a word has been split intoWordPieces, the first token does not have any marker and any subsequence
-    tokens are prefixed with ##. So whenever we see the ## token, we
-    append it to the previous set of word indexes. Note that Whole Word Masking does *not* change the training code
-    at all -- we still predict each WordPiece independently, softmaxed over the entire vocabulary.
-    This implementation is mainly a copy from the original code by Google, but includes some simplifications.
 
-    :param tokens: tokenized sentence.
-    :type tokens: [str]
-    :param vocab: vocabulary for choosing tokens for random masking.
-    :type vocab: dict
-    :param token_groups: If supplied, only whole groups of tokens get masked. This can be whole words but
-    also other types (e.g. spans). Booleans indicate the start of a group.
-    :type token_groups: [bool]
-    :param max_predictions_per_seq: maximum number of masked tokens
-    :type max_predictions_per_seq: int
-    :param masked_lm_prob: probability of masking a token
-    :type masked_lm_prob: float
-    :return: (list of str, list of int), masked tokens and related labels for LM prediction
-    """
-
-    #TODO make special tokens model independent
-
-    # 1. Combine tokens to one group (e.g. all subtokens of a word)
-    cand_indices = []
-    for (i, token) in enumerate(tokens):
-        if token == "[CLS]" or token == "[SEP]":
-            continue
-        if (token_groups and len(cand_indices) >= 1 and not token_groups[i]):
-            cand_indices[-1].append(i)
-        else:
-            cand_indices.append([i])
-
-    num_to_mask = min(max_predictions_per_seq,
-                      max(1, int(round(len(tokens) * masked_lm_prob))))
-
-    random.shuffle(cand_indices)
-    output_label = [''] * len(tokens)
-    num_masked = 0
-    assert "[MASK]" not in tokens
-
-    # 2. Mask the first groups until we reach the number of tokens we wanted to mask (num_to_mask)
-    for index_set in cand_indices:
-        if num_masked >= num_to_mask:
-            break
-        # If adding a whole-word mask would exceed the maximum number of
-        # predictions, then just skip this candidate.
-        if num_masked + len(index_set) > num_to_mask:
-            continue
-
-        for index in index_set:
-            prob = random.random()
-            num_masked += 1
-            original_token = tokens[index]
-            # 80% randomly change token to mask token
-            if prob < 0.8:
-                tokens[index] = "[MASK]"
-
-            # 10% randomly change token to random token
-            #TODO currently custom vocab is not included here
-            elif prob < 0.9:
-                tokens[index] = random.choice(list(vocab.items()))[0]
-
-            # -> rest 10% randomly keep current token
-
-            # append current token to output (we will predict these later)
-            try:
-                output_label[index] = original_token
-            except KeyError:
-                # For unknown words (should not occur with BPE vocab)
-                output_label[index] = "[UNK]"
-                logger.warning(
-                    "Cannot find token '{}' in vocab. Using [UNK] instead".format(original_token)
-                )
-
-    return tokens, output_label
 
 
 def is_json(x):
@@ -820,27 +724,3 @@ def split_with_metadata(text):
     indexes = generate_tok_to_ch_map(text)
     assert len(split_text) == len(indexes)
     return split_text, indexes
-
-
-def convert_qa_input_dict(infer_dict):
-    """ Input dictionaries in QA can either have ["context", "qas"] (internal format) as keys or
-    ["text", "questions"] (api format). This function converts the latter into the former. It also converts the
-    is_impossible field to answer_type so that NQ and SQuAD dicts have the same format.
-    """
-    try:
-        # Check if infer_dict is already in internal json format
-        if "context" in infer_dict and "qas" in infer_dict:
-            return infer_dict
-        # converts dicts from inference mode to data structure used in FARM
-        questions = infer_dict["questions"]
-        text = infer_dict["text"]
-        uid = infer_dict.get("id", None)
-        qas = [{"question": q,
-                "id": uid,
-                "answers": [],
-                "answer_type": None} for i, q in enumerate(questions)]
-        converted = {"qas": qas,
-                     "context": text}
-        return converted
-    except KeyError:
-        raise Exception("Input does not have the expected format")

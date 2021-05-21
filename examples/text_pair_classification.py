@@ -3,12 +3,12 @@ import logging
 from pathlib import Path
 
 from farm.data_handler.data_silo import DataSilo
-from farm.data_handler.processor import RegressionProcessor, TextPairClassificationProcessor
+from farm.data_handler.processor import TextPairClassificationProcessor
 from farm.experiment import initialize_optimizer
 from farm.infer import Inferencer
 from farm.modeling.adaptive_model import AdaptiveModel
 from farm.modeling.language_model import LanguageModel
-from farm.modeling.prediction_head import RegressionHead, TextClassificationHead
+from farm.modeling.prediction_head import TextClassificationHead
 from farm.modeling.tokenization import Tokenizer
 from farm.train import Trainer
 from farm.utils import set_all_seeds, MLFlowLogger, initialize_device_settings
@@ -45,6 +45,7 @@ def text_pair_classification():
                                                 label_list=label_list,
                                                 metric="f1_macro",
                                                 max_seq_len=128,
+                                                train_filename="train.tsv",
                                                 dev_filename="dev.tsv",
                                                 test_filename=None,
                                                 data_dir=Path("../data/asnq_binary"),
@@ -59,9 +60,7 @@ def text_pair_classification():
     # a) which consists of a pretrained language model as a basis
     language_model = LanguageModel.load(lang_model)
     # b) and a prediction head on top that is suited for our task
-    prediction_head = TextClassificationHead(num_labels=len(label_list),
-                                             class_weights=data_silo.calculate_class_weights(task_name="text_classification")
-                                             )
+    prediction_head = TextClassificationHead(num_labels=len(label_list))
 
     model = AdaptiveModel(
         language_model=language_model,
@@ -73,7 +72,7 @@ def text_pair_classification():
     # 5. Create an optimizer
     model, optimizer, lr_schedule = initialize_optimizer(
         model=model,
-        learning_rate=5e-6,
+        learning_rate=2e-5,
         device=device,
         n_batches=len(data_silo.loaders["train"]),
         n_epochs=n_epochs)
@@ -99,9 +98,13 @@ def text_pair_classification():
 
     # 9. Load it & harvest your fruits (Inference)
     #    Add your own text adapted to the dataset you provide
+    # For correct Text Pair Classification on raw dictionaries (inference mode), we need to put both
+    # texts (text, text_b) into a tuple.
+    # See corresponding conversion in the file_to_dicts() method of TextPairClassificationProcessor: https://github.com/deepset-ai/FARM/blob/5ab5b1620cb51ceb874d4b30c887e377ad1a6e9a/farm/data_handler/processor.py#L744
     basic_texts = [
-        {"text": "how many times have real madrid won the champions league in a row", "text_b": "They have also won the competition the most times in a row, winning it five times from 1956 to 1960"},
-        {"text": "how many seasons of the blacklist are there on netflix", "text_b": "Retrieved March 27 , 2018 ."},
+        {"text": ("how many times have real madrid won the champions league in a row",
+                  "They have also won the competition the most times in a row, winning it five times from 1956 to 1960")},
+        {"text": ("how many seasons of the blacklist are there on netflix", "Retrieved March 27 , 2018 .")},
     ]
 
     model = Inferencer.load(save_dir)

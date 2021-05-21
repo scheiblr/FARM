@@ -1,6 +1,8 @@
 import logging
 
 import numpy as np
+import torch
+from functools import reduce
 from scipy.stats import pearsonr, spearmanr
 from seqeval.metrics import classification_report as token_classification_report
 from seqeval.metrics import f1_score as ner_f1_score
@@ -53,7 +55,7 @@ def simple_accuracy(preds, labels):
 def acc_and_f1(preds, labels):
     acc = simple_accuracy(preds, labels)
     f1 = f1_score(y_true=labels, y_pred=preds)
-    return {"acc": acc, "f1": f1, "acc_and_f1": (acc + f1) / 2}
+    return {"acc": acc['acc'], "f1": f1, "acc_and_f1": (acc['acc'] + f1) / 2}
 
 
 def f1_macro(preds, labels):
@@ -92,6 +94,8 @@ def compute_metrics(metric, preds, labels):
         return {"r2": r2_score(preds, labels)}
     elif metric == "top_n_accuracy":
         return {"top_n_accuracy": top_n_accuracy(preds, labels)}
+    elif metric == "text_similarity_metric":
+        return text_similarity_metric(preds, labels)
     # elif metric == "masked_accuracy":
     #     return simple_accuracy(preds, labels, ignore=-1)
     elif metric in registered_metrics:
@@ -124,6 +128,10 @@ def compute_report_metrics(head, preds, labels):
             # For multilabel classification, we don't eval with string labels here, but with multihot vectors.
             # Therefore we need to supply all possible label ids instead of label values.
             all_possible_labels = list(range(len(head.label_list)))
+        elif head.model_type == "text_similarity":
+            labels = reduce(lambda x, y: x + list(y.astype('long')), labels, [])
+            preds = reduce(lambda x, y: x + [0] * y[0] + [1] + [0] * (len(y) - y[0] - 1), preds, [])
+            all_possible_labels = list(range(len(head.label_list)))
         else:
             all_possible_labels = head.label_list
         return report_fn(
@@ -138,17 +146,34 @@ def compute_report_metrics(head, preds, labels):
 
 
 def squad_EM(preds, labels):
-    # TODO write comment describing function
+    """
+    Count how often the pair of predicted start and end index exactly matches one of the labels
+    """
     n_docs = len(preds)
     n_correct = 0
-    for doc_idx in range(n_docs):
-        qa_candidate = preds[doc_idx][0][0]
+    for (pred, label) in zip(preds, labels):
+        qa_candidate = pred[0][0]
         pred_start = qa_candidate.offset_answer_start
         pred_end = qa_candidate.offset_answer_end
-        curr_labels = labels[doc_idx]
+        curr_labels = label
         if (pred_start, pred_end) in curr_labels:
             n_correct += 1
-    return n_correct/n_docs
+    return n_correct/n_docs if n_docs else 0
+
+def squad_EM_start(preds, labels):
+    """
+    Count how often the predicted start index exactly matches the start index given by one of the labels
+    """
+    n_docs = len(preds)
+    n_correct = 0
+    for (pred, label) in zip(preds, labels):
+        qa_candidate = pred[0][0]
+        pred_start = qa_candidate.offset_answer_start
+        curr_labels = label
+        curr_labels_start = [curr_label[0] for curr_label in curr_labels]
+        if pred_start in curr_labels_start:
+            n_correct += 1
+    return n_correct/n_docs if n_docs else 0
 
 def squad_f1(preds, labels):
     f1_scores = []
@@ -181,11 +206,60 @@ def squad_f1_single(pred, label, pred_idx=0):
     f1 = (2 * precision * recall) / (precision + recall)
     return f1
 
-def squad(preds, labels):
+
+def confidence(preds):
+    conf = 0
+    for pred in preds:
+        conf += pred[0][0].confidence
+    return conf/len(preds) if len(preds) else 0
+
+
+def metrics_per_bin(preds, labels, num_bins=10):
+    pred_bins = [[] for _ in range(num_bins)]
+    label_bins = [[] for _ in range(num_bins)]
+    count_per_bin = [0]*num_bins
+    for (pred, label) in zip(preds, labels):
+        current_score = pred[0][0].confidence
+        if current_score >= 1.0:
+            current_score = 0.9999
+        pred_bins[int(current_score*num_bins)].append(pred)
+        label_bins[int(current_score*num_bins)].append(label)
+        count_per_bin[int(current_score*num_bins)] += 1
+
+    em_per_bin = [0]*num_bins
+    confidence_per_bin = [0]*num_bins
+    for i in range(num_bins):
+        em_per_bin[i] = squad_EM_start(preds=pred_bins[i], labels=label_bins[i])
+        confidence_per_bin[i] = confidence(preds=pred_bins[i])
+    return em_per_bin, confidence_per_bin, count_per_bin
+
+def squad_base(preds, labels):
     em = squad_EM(preds=preds, labels=labels)
     f1 = squad_f1(preds=preds, labels=labels)
     top_acc = top_n_accuracy(preds=preds, labels=labels)
     return {"EM": em, "f1": f1, "top_n_accuracy": top_acc}
+
+def squad(preds, labels):
+    """
+    This method calculates squad evaluation metrics a) overall, b) for questions with text answer and c) for questions with no answer
+    """
+    # TODO change check for no_answer questions from using (start,end)==(-1,-1) to is_impossible flag in QAInput. This needs to be done for labels though. Not for predictions.
+    overall_results = squad_base(preds, labels)
+
+    preds_answer = [pred for (pred, label) in zip(preds, labels) if (-1, -1) not in label]
+    labels_answer = [label for label in labels if (-1, -1) not in label]
+    answer_results = squad_base(preds_answer, labels_answer)
+
+    preds_no_answer = [pred for (pred, label) in zip(preds, labels) if (-1, -1) in label]
+    labels_no_answer = [label for label in labels if (-1, -1) in label]
+    no_answer_results = squad_base(preds_no_answer, labels_no_answer)
+
+    return {"EM": overall_results["EM"], "f1": overall_results["f1"], "top_n_accuracy": overall_results["top_n_accuracy"],
+            "EM_text_answer": answer_results["EM"], "f1_text_answer": answer_results["f1"], "top_n_accuracy_text_answer": answer_results["top_n_accuracy"],
+            "Total_text_answer": len(preds_answer),
+            "EM_no_answer": no_answer_results["EM"], "f1_no_answer": no_answer_results["f1"], "top_n_accuracy_no_answer": no_answer_results["top_n_accuracy"],
+            "Total_no_answer": len(preds_no_answer)
+            }
 
 def top_n_accuracy(preds, labels):
     """
@@ -210,3 +284,52 @@ def top_n_accuracy(preds, labels):
 
     return np.mean(answer_in_top_n)
 
+def text_similarity_acc_and_f1(preds, labels):
+    """
+    Returns accuracy and F1 scores for top-1(highest) ranked sequence(context/passage) for each sample/query
+
+    :param preds: list of numpy arrays of dimension n1 x n2 containing n2 predicted ranks for n1 sequences/queries
+    :type preds: List of numpy array containing similarity scores for each sequence in batch
+    :param labels: list of arrays of dimension n1 x n2 where each array contains n2 labels(0/1) indicating whether the sequence/passage is a positive(1) passage or hard_negative(0) passage
+    :type labels: List of list containing values(0/1)
+
+    :return: predicted ranks of passages for each query
+    """
+    top_1_pred = reduce(lambda x, y: x + [0] * y[0] + [1] + [0] * (len(y) - y[0] - 1), preds, [])
+    labels = reduce(lambda x, y: x + list(y.astype('long')), labels, [])
+    res = acc_and_f1(top_1_pred, labels)
+    return res
+
+def text_similarity_avg_ranks(preds, labels):
+    """
+    Calculates average predicted rank of positive sequence(context/passage) for each sample/query
+
+    :param preds: list of numpy arrays of dimension n1 x n2 containing n2 predicted ranks for n1 sequences/queries
+    :type preds: List of numpy array containing similarity scores for each sequence in batch
+    :param labels: list of arrays of dimension n1 x n2 where each array contains n2 labels(0/1) indicating whether the sequence/passage is a positive(1) passage or hard_negative(0) passage
+    :type labels: List of list containing values(0/1)
+
+    :return: average predicted ranks of positive sequence/passage for each sample/query
+    """
+    positive_idx_per_question = list(reduce(lambda x, y: x + list((y == 1).nonzero()[0]), labels, []))
+    rank = 0
+    for i, idx in enumerate(positive_idx_per_question):
+        # aggregate the rank of the known gold passage in the sorted results for each question
+        gold_idx = (preds[i] == idx).nonzero()[0]
+        rank += gold_idx.item()
+    return float(rank / len(preds))
+
+def text_similarity_metric(preds, labels):
+    """
+    Returns accuracy, F1 scores and average rank scores for text similarity task
+
+    :param preds: list of numpy arrays of dimension n1 x n2 containing n2 predicted ranks for n1 sequences/queries
+    :type preds: List of numpy array containing similarity scores for each sequence in batch
+    :param labels: list of arrays of dimension n1 x n2 where each array contains n2 labels(0/1) indicating whether the sequence/passage is a positive(1) passage or hard_negative(0) passage
+    :type labels: List of list containing values(0/1)
+
+    :return metrics(accuracy, F1, average rank) for text similarity task
+    """
+    scores = text_similarity_acc_and_f1(preds, labels)
+    scores["average_rank"] = text_similarity_avg_ranks(preds, labels)
+    return scores

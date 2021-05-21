@@ -3,27 +3,23 @@ import multiprocessing as mp
 import os
 from functools import partial
 import warnings
-import time
 
 import torch
 from torch.utils.data.sampler import SequentialSampler
 from tqdm import tqdm
-from transformers.configuration_auto import AutoConfig
 from typing import Generator, List, Union
 
 from farm.data_handler.dataloader import NamedDataLoader
-from farm.data_handler.processor import Processor, InferenceProcessor, SquadProcessor, NERProcessor, TextClassificationProcessor
+from farm.data_handler.processor import Processor, InferenceProcessor, NaturalQuestionsProcessor
 from farm.data_handler.utils import grouper
 from farm.data_handler.inputs import QAInput
-from farm.modeling.tokenization import Tokenizer
 from farm.modeling.adaptive_model import AdaptiveModel, BaseAdaptiveModel, ONNXAdaptiveModel
 from farm.modeling.optimization import optimize_model
-from farm.utils import initialize_device_settings
+from farm.utils import initialize_device_settings, MLFlowLogger
 from farm.utils import set_all_seeds, calc_chunksize, log_ascii_workers, Benchmarker
 from farm.modeling.predictions import QAPred
 
 logger = logging.getLogger(__name__)
-
 
 class Inferencer:
     """
@@ -112,6 +108,8 @@ class Inferencer:
         :return: An instance of the Inferencer.
 
         """
+        MLFlowLogger.disable()
+
         # For benchmarking
         if dummy_ph:
             model.bypass_ph()
@@ -131,6 +129,7 @@ class Inferencer:
         self.language = self.model.get_language()
         self.task_type = task_type
         self.disable_tqdm = disable_tqdm
+        self.problematic_sample_ids = set()
 
         if task_type == "embeddings":
             if not extraction_layer or not extraction_strategy:
@@ -155,6 +154,7 @@ class Inferencer:
     def load(
         cls,
         model_name_or_path,
+        revision=None,
         batch_size=4,
         gpu=False,
         task_type=None,
@@ -168,11 +168,11 @@ class Inferencer:
         num_processes=None,
         disable_tqdm=False,
         tokenizer_class=None,
-        use_fast=False,
+        use_fast=True,
         tokenizer_args=None,
+        multithreading_rust=True,
         dummy_ph=False,
         benchmarking=False,
-
     ):
         """
         Load an Inferencer incl. all relevant components (model, tokenizer, processor ...) either by
@@ -182,6 +182,8 @@ class Inferencer:
 
         :param model_name_or_path: Local directory or public name of the model to load.
         :type model_name_or_path: str
+        :param revision: The version of model to use from the HuggingFace model hub. Can be tag name, branch name, or commit hash.
+        :type revision: str
         :param batch_size: Number of samples computed once per batch
         :type batch_size: int
         :param gpu: If GPU shall be used
@@ -217,13 +219,17 @@ class Inferencer:
         :type disable_tqdm: bool
         :param tokenizer_class: (Optional) Name of the tokenizer class to load (e.g. `BertTokenizer`)
         :type tokenizer_class: str
-        :param use_fast: (Optional, False by default) Indicate if FARM should try to load the fast version of the tokenizer (True) or
+        :param use_fast: (Optional, True by default) Indicate if FARM should try to load the fast version of the tokenizer (True) or
             use the Python one (False).
+        :type use_fast: bool
         :param tokenizer_args: (Optional) Will be passed to the Tokenizer ``__init__`` method.
             See https://huggingface.co/transformers/main_classes/tokenizer.html and detailed tokenizer documentation
             on `Hugging Face Transformers <https://huggingface.co/transformers/>`_.
         :type tokenizer_args: dict
-        :type use_fast: bool
+        :param multithreading_rust: Whether to allow multithreading in Rust, e.g. for FastTokenizers.
+                                    Note: Enabling multithreading in Rust AND multiprocessing in python might cause
+                                    deadlocks.
+        :type multithreading_rust: bool
         :param dummy_ph: If True, methods of the prediction head will be replaced
                              with a dummy method. This is used to isolate lm run time from ph run time.
         :type dummy_ph: bool
@@ -249,63 +255,35 @@ class Inferencer:
             else:
                 processor = Processor.load_from_dir(model_name_or_path)
 
-            # override processor attributes loaded from config file with inferencer params
-            processor.max_seq_len = max_seq_len
-            if hasattr(processor, "doc_stride"):
-                processor.doc_stride = doc_stride
-
         # b) or from remote transformers model hub
         else:
-            logger.info(f"Could not find `{model_name_or_path}` locally. Try to download from model hub ...")
             if not task_type:
                 raise ValueError("Please specify the 'task_type' of the model you want to load from transformers. "
                                  "Valid options for arg `task_type`:"
                                  "'question_answering', 'embeddings', 'text_classification', 'ner'")
 
-            model = AdaptiveModel.convert_from_transformers(model_name_or_path, device, task_type)
-            config = AutoConfig.from_pretrained(model_name_or_path)
-            tokenizer = Tokenizer.load(model_name_or_path,
-                                       tokenizer_class=tokenizer_class,
-                                       use_fast=use_fast,
-                                       **tokenizer_args,
-                                       )
+            model = AdaptiveModel.convert_from_transformers(model_name_or_path,
+                                                            revision=revision,
+                                                            device=device,
+                                                            task_type=task_type)
+            processor = Processor.convert_from_transformers(model_name_or_path,
+                                                            revision=revision,
+                                                            task_type=task_type,
+                                                            max_seq_len=max_seq_len,
+                                                            doc_stride=doc_stride,
+                                                            tokenizer_class=tokenizer_class,
+                                                            tokenizer_args=tokenizer_args,
+                                                            use_fast=use_fast)
 
-            # TODO infer task_type automatically from config (if possible)
-            if task_type == "question_answering":
-                processor = SquadProcessor(
-                    tokenizer=tokenizer,
-                    max_seq_len=max_seq_len,
-                    label_list=["start_token", "end_token"],
-                    metric="squad",
-                    data_dir="data",
-                    doc_stride=doc_stride
-                )
-            elif task_type == "embeddings":
-                processor = InferenceProcessor(tokenizer=tokenizer, max_seq_len=max_seq_len)
+        # override processor attributes loaded from config or HF with inferencer params
+        processor.max_seq_len = max_seq_len
+        processor.multithreading_rust = multithreading_rust
+        if hasattr(processor, "doc_stride"):
+            assert doc_stride < max_seq_len, "doc_stride is longer than max_seq_len. This means that there will be gaps " \
+                                             "as the passage windows slide, causing the model to skip over parts of the document. " \
+                                             "Please set a lower value for doc_stride (Suggestions: doc_stride=128, max_seq_len=384) "
+            processor.doc_stride = doc_stride
 
-            elif task_type == "text_classification":
-                label_list = list(config.id2label[id] for id in range(len(config.id2label)))
-                processor = TextClassificationProcessor(tokenizer=tokenizer,
-                                                        max_seq_len=max_seq_len,
-                                                        data_dir="data",
-                                                        label_list=label_list,
-                                                        label_column_name="label",
-                                                        metric="acc",
-                                                        quote_char='"',
-                                                        )
-            elif task_type == "ner":
-                label_list = list(config.label2id.keys())
-                processor = NERProcessor(
-                    tokenizer=tokenizer, max_seq_len=max_seq_len, data_dir="data", metric="seq_f1",
-                    label_list=label_list
-                )
-            else:
-                raise ValueError(f"`task_type` {task_type} is not supported yet. "
-                                 f"Valid options for arg `task_type`: 'question_answering', "
-                                 f"'embeddings', 'text_classification', 'ner'")
-
-        if not isinstance(model,ONNXAdaptiveModel):
-            model, _ = optimize_model(model=model, device=device, local_rank=-1, optimizer=None)
         return cls(
             model,
             processor,
@@ -343,7 +321,10 @@ class Inferencer:
             self.process_pool = None
         else:
             if num_processes is None:  # use all CPU cores
-                num_processes = mp.cpu_count() - 1
+                if mp.cpu_count() > 3:
+                    num_processes = mp.cpu_count() - 1
+                else:
+                    num_processes = mp.cpu_count()
             self.process_pool = mp.Pool(processes=num_processes)
             logger.info(
                 f"Got ya {num_processes} parallel workers to do inference ..."
@@ -408,7 +389,6 @@ class Inferencer:
         Runs down-stream inference on samples created from input dictionaries.
         The format of the input `dicts` depends on the task:
 
-        * QA (SQuAD style):    [{"qas": ["What is X?"], "context":  "Some context containing the answer"}] (Deprecated)
         * QA (FARM style): [{"questions": ["What is X?"], "text":  "Some context containing the answer"}]
         * Classification / NER / embeddings: [{"text": "Some input text"}]
 
@@ -439,9 +419,10 @@ class Inferencer:
         """
 
         # whether to aggregate predictions across different samples (e.g. for QA on long texts)
-        if set(dicts[0].keys()) == {"qas", "context"}:
-            warnings.warn("QA Input dictionaries with [qas, context] as keys will be deprecated in the future",
-                          DeprecationWarning)
+        # TODO remove or adjust after implmenting input objects properly
+        # if set(dicts[0].keys()) == {"qas", "context"}:
+        #     warnings.warn("QA Input dictionaries with [qas, context] as keys will be deprecated in the future",
+        #                   DeprecationWarning)
 
         aggregate_preds = False
         if len(self.model.prediction_heads) > 0:
@@ -469,6 +450,7 @@ class Inferencer:
                 dicts, return_json, aggregate_preds, multiprocessing_chunksize,
             )
 
+            self.processor.log_problematic(self.problematic_sample_ids)
             # return a generator object if streaming is enabled, else, cast the generator to a list.
             if not streaming and type(predictions) != list:
                 return list(predictions)
@@ -491,10 +473,11 @@ class Inferencer:
         :return: list of predictions
         :rtype: list
         """
-        dataset, tensor_names, baskets = self.processor.dataset_from_dicts(
-            dicts, indices=[i for i in range(len(dicts))], return_baskets=True
+        indices = list(range(len(dicts)))
+        dataset, tensor_names, problematic_ids, baskets = self.processor.dataset_from_dicts(
+            dicts, indices=indices, return_baskets=True
         )
-
+        self.problematic_sample_ids = problematic_ids
         if self.benchmarking:
             self.benchmarker.record("dataset_single_proc")
 
@@ -542,22 +525,27 @@ class Inferencer:
 
         # Once a process spits out a preprocessed chunk. we feed this dataset directly to the model.
         # So we don't need to wait until all preprocessing has finished before getting first predictions.
-        for dataset, tensor_names, baskets in results:
-            # TODO change format of formatted_preds in QA (list of dicts)
-            if aggregate_preds:
-                predictions = self._get_predictions_and_aggregate(
-                    dataset, tensor_names, baskets
-                )
+        for dataset, tensor_names, problematic_sample_ids, baskets in results:
+            self.problematic_sample_ids.update(problematic_sample_ids)
+            if dataset is None:
+                logger.error(f"Part of the dataset could not be converted! \n"
+                             f"BE AWARE: The order of predictions will not conform with the input order!")
             else:
-                predictions = self._get_predictions(dataset, tensor_names, baskets)
+                # TODO change format of formatted_preds in QA (list of dicts)
+                if aggregate_preds:
+                    predictions = self._get_predictions_and_aggregate(
+                        dataset, tensor_names, baskets
+                    )
+                else:
+                    predictions = self._get_predictions(dataset, tensor_names, baskets)
 
-            if return_json:
-                # TODO this try catch should be removed when all tasks return prediction objects
-                try:
-                    predictions = [x.to_json() for x in predictions]
-                except AttributeError:
-                    pass
-            yield from predictions
+                if return_json:
+                    # TODO this try catch should be removed when all tasks return prediction objects
+                    try:
+                        predictions = [x.to_json() for x in predictions]
+                    except AttributeError:
+                        pass
+                yield from predictions
 
     @classmethod
     def _create_datasets_chunkwise(cls, chunk, processor):
@@ -566,8 +554,8 @@ class Inferencer:
         The resulting datasets of the processes are merged together afterwards"""
         dicts = [d[1] for d in chunk]
         indices = [d[0] for d in chunk]
-        dataset, tensor_names, baskets = processor.dataset_from_dicts(dicts, indices, return_baskets=True)
-        return dataset, tensor_names, baskets
+        dataset, tensor_names, problematic_sample_ids, baskets = processor.dataset_from_dicts(dicts, indices, return_baskets=True)
+        return dataset, tensor_names, problematic_sample_ids, baskets
 
     def _get_predictions(self, dataset, tensor_names, baskets):
         """
@@ -693,6 +681,10 @@ class QAInferencer(Inferencer):
                              return_json=True,
                              multiprocessing_chunksize=None,
                              streaming=False) -> Union[List[QAPred], Generator[QAPred, None, None]]:
+        if isinstance(self.processor, NaturalQuestionsProcessor):
+            for questions_key in ['questions', 'qas']:
+                if questions_key in dicts[0].keys() and any([len(dict[questions_key]) > 1 for dict in dicts]):
+                    logger.warning('More than one question for document. NaturalQuestions inference will return just the answer to the first question.')
         return Inferencer.inference_from_dicts(self, dicts, return_json=return_json,
                                                multiprocessing_chunksize=multiprocessing_chunksize, streaming=streaming)
 
@@ -710,6 +702,8 @@ class QAInferencer(Inferencer):
                                multiprocessing_chunksize=None,
                                streaming=False) -> Union[List[QAPred], Generator[QAPred, None, None]]:
         dicts = [o.to_dict() for o in objects]
+        # TODO investigate this deprecation warning. Timo: I thought we were about to implement Input Objects, then we can and should use inference from (input) objects!
+        #logger.warning("QAInferencer.inference_from_objects() will soon be deprecated. Use QAInferencer.inference_from_dicts() instead")
         return self.inference_from_dicts(dicts, return_json=return_json,
                                          multiprocessing_chunksize=multiprocessing_chunksize, streaming=streaming)
 

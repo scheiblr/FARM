@@ -1,13 +1,13 @@
 import pytest
 import numpy as np
-import transformers
 
 from farm.infer import Inferencer
+from transformers import BertTokenizerFast
 
 
 @pytest.mark.parametrize("streaming", [True, False])
 @pytest.mark.parametrize("multiprocessing_chunksize", [None, 2])
-@pytest.mark.parametrize("num_processes", [2, 0, None], scope="session")
+@pytest.mark.parametrize("num_processes", [2, 0, None], scope="module")
 def test_qa_format_and_results(adaptive_model_qa, streaming, multiprocessing_chunksize):
     qa_inputs_dicts = [
         {
@@ -75,7 +75,7 @@ def test_qa_format_and_results(adaptive_model_qa, streaming, multiprocessing_chu
 
 
 @pytest.mark.parametrize("num_processes", [0], scope="session")
-@pytest.mark.parametrize("use_fast", [False, True])
+@pytest.mark.parametrize("use_fast", [True])
 def test_embeddings_extraction(num_processes, use_fast):
     # Input
     basic_texts = [
@@ -92,20 +92,21 @@ def test_embeddings_extraction(num_processes, use_fast):
         extraction_strategy="reduce_mean",
         extraction_layer=-2,
         use_fast=use_fast,
-        num_processes=num_processes)
+        num_processes=num_processes,
+    )
 
     # Get embeddings for input text (you can vary the strategy and layer)
     result = model.inference_from_dicts(dicts=basic_texts)
-    assert result[0]["context"] == ['Schar', '##tau', 'sagte', 'dem', 'Tages', '##spiegel', ',', 'dass', 'Fischer', 'ein', 'Id', '##iot', 'ist']
+    assert result[0]["context"] == basic_texts[0]["text"]
     assert result[0]["vec"].shape == (768,)
-    assert np.isclose(result[0]["vec"][0], 0.01501756374325071)
+    assert np.isclose(result[0]["vec"][0], 0.01501756374325071, atol=0.00001)
 
 
 def test_inferencer_with_fast_bert_tokenizer():
     model = Inferencer.load("bert-base-german-cased", task_type='text_classification',
                             use_fast=True, num_processes=0)
     tokenizer = model.processor.tokenizer
-    assert type(tokenizer) is transformers.tokenization_bert.BertTokenizerFast
+    assert type(tokenizer) is BertTokenizerFast
 
 
 if __name__ == "__main__":

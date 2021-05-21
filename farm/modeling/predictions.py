@@ -37,6 +37,7 @@ class QACandidate:
                  probability: float=None,
                  n_passages_in_doc: int=None,
                  passage_id: str=None,
+                 confidence: float=None,
                  ):
         """
         :param answer_type: The category that this answer falls into e.g. "no_answer", "yes", "no" or "span"
@@ -48,6 +49,7 @@ class QACandidate:
         :param probability: The probability the model assigns to the answer
         :param n_passages_in_doc: Number of passages that make up the document
         :param passage_id: The id of the passage which contains this candidate answer
+        :param confidence: The (calibrated) confidence score representing the model's predicted accuracy of the index of the start of the answer span
         """
 
         # self.answer_type can be "no_answer", "yes", "no" or "span"
@@ -79,6 +81,7 @@ class QACandidate:
 
         self.n_passages_in_doc = n_passages_in_doc
         self.passage_id = passage_id
+        self.confidence = confidence
 
         # This attribute is used by Haystack to store sample metadata
         self.meta = None
@@ -179,15 +182,24 @@ class QACandidate:
         # to the end of the document
         end_t = min(end_t, n_tokens)
 
-        start_ch = token_offsets[start_t]
+        start_ch = int(token_offsets[start_t])
         # i.e. pointing at the END of the last token
         if end_t == n_tokens:
             end_ch = len(clear_text)
         else:
             end_ch = token_offsets[end_t]
 
-        final_text = clear_text[start_ch: end_ch].strip()
-        end_ch = start_ch + len(final_text)
+        final_text = clear_text[start_ch: end_ch]
+
+        # if the final_text is more than whitespaces we trim it otherwise return a no_answer
+        # final_text can be an empty string if start_t points to the very final token of the passage
+        # final_text can be a whitespace if there is a whitespace token in the text, e.g.,
+        # if the original text contained multiple consecutive whitespaces
+        if len(final_text.strip()) > 0:
+            final_text = final_text.strip()
+        else:
+            return "", 0, 0
+        end_ch = int(start_ch + len(final_text))
 
         return final_text, start_ch, end_ch
 

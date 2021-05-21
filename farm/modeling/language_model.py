@@ -34,16 +34,21 @@ from torch import nn
 
 logger = logging.getLogger(__name__)
 
-from transformers.modeling_bert import BertModel, BertConfig
-from transformers.modeling_roberta import RobertaModel, RobertaConfig
-from transformers.modeling_xlnet import XLNetModel, XLNetConfig
-from transformers.modeling_albert import AlbertModel, AlbertConfig
-from transformers.modeling_xlm_roberta import XLMRobertaModel, XLMRobertaConfig
-from transformers.modeling_distilbert import DistilBertModel, DistilBertConfig
-from transformers.modeling_electra import ElectraModel, ElectraConfig
-from transformers.modeling_camembert import CamembertModel, CamembertConfig
+from transformers import (
+    BertModel, BertConfig,
+    RobertaModel, RobertaConfig,
+    XLNetModel, XLNetConfig,
+    AlbertModel, AlbertConfig,
+    XLMRobertaModel, XLMRobertaConfig,
+    DistilBertModel, DistilBertConfig,
+    ElectraModel, ElectraConfig,
+    CamembertModel, CamembertConfig
+)
+
+from transformers import AutoModel, AutoConfig
 from transformers.modeling_utils import SequenceSummary
-from transformers.tokenization_bert import load_vocab
+from transformers.models.bert.tokenization_bert import load_vocab
+import transformers
 
 from farm.modeling import wordembedding_utils
 from farm.modeling.wordembedding_utils import s3e_pooling
@@ -79,7 +84,7 @@ class LanguageModel(nn.Module):
         return model.from_scratch(vocab_size)
 
     @classmethod
-    def load(cls, pretrained_model_name_or_path, n_added_tokens=0, language_model_class=None, **kwargs):
+    def load(cls, pretrained_model_name_or_path, revision=None, n_added_tokens=0, language_model_class=None, **kwargs):
         """
         Load a pretrained language model either by
 
@@ -109,52 +114,37 @@ class LanguageModel(nn.Module):
         * google/electra-small-discriminator
         * google/electra-base-discriminator
         * google/electra-large-discriminator
+        * facebook/dpr-question_encoder-single-nq-base
+        * facebook/dpr-ctx_encoder-single-nq-base
 
         See all supported model variations here: https://huggingface.co/models
 
-        The appropriate language model class is inferred automatically from `pretrained_model_name_or_path`
+        The appropriate language model class is inferred automatically from model config
         or can be manually supplied via `language_model_class`.
 
         :param pretrained_model_name_or_path: The path of the saved pretrained model or its name.
         :type pretrained_model_name_or_path: str
+        :param revision: The version of model to use from the HuggingFace model hub. Can be tag name, branch name, or commit hash.
+        :type revision: str
         :param language_model_class: (Optional) Name of the language model class to load (e.g. `Bert`)
         :type language_model_class: str
 
         """
+        kwargs["revision"] = revision
+        logger.info("")
+        logger.info("LOADING MODEL")
+        logger.info("=============")
         config_file = Path(pretrained_model_name_or_path) / "language_model_config.json"
         if os.path.exists(config_file):
+            logger.info(f"Model found locally at {pretrained_model_name_or_path}")
             # it's a local directory in FARM format
             config = json.load(open(config_file))
             language_model = cls.subclasses[config["name"]].load(pretrained_model_name_or_path)
         else:
+            logger.info(f"Could not find {pretrained_model_name_or_path} locally.")
+            logger.info(f"Looking on Transformers Model Hub (in local cache and online)...")
             if language_model_class is None:
-                # it's transformers format (either from model hub or local)
-                pretrained_model_name_or_path = str(pretrained_model_name_or_path)
-                if "xlm" in pretrained_model_name_or_path and "roberta" in pretrained_model_name_or_path:
-                    language_model_class = 'XLMRoberta'
-                elif 'roberta' in pretrained_model_name_or_path:
-                    language_model_class = 'Roberta'
-                elif 'codebert' in pretrained_model_name_or_path.lower():
-                    if "mlm" in pretrained_model_name_or_path.lower():
-                        raise NotImplementedError("MLM part of codebert is currently not supported in FARM")
-                    else:
-                        language_model_class = 'Roberta'
-                elif 'camembert' in pretrained_model_name_or_path or 'umberto' in pretrained_model_name_or_path:
-                    language_model_class = "Camembert"
-                elif 'albert' in pretrained_model_name_or_path:
-                    language_model_class = 'Albert'
-                elif 'distilbert' in pretrained_model_name_or_path:
-                    language_model_class = 'DistilBert'
-                elif 'bert' in pretrained_model_name_or_path:
-                    language_model_class = 'Bert'
-                elif 'xlnet' in pretrained_model_name_or_path:
-                    language_model_class = 'XLNet'
-                elif 'electra' in pretrained_model_name_or_path:
-                    language_model_class = 'Electra'
-                elif "word2vec" in pretrained_model_name_or_path.lower() or "glove" in pretrained_model_name_or_path.lower():
-                    language_model_class = 'WordEmbedding_LM'
-                elif "minilm" in pretrained_model_name_or_path.lower():
-                    language_model_class = "Bert"
+                language_model_class = cls.get_language_model_class(pretrained_model_name_or_path)
 
             if language_model_class:
                 language_model = cls.subclasses[language_model_class].load(pretrained_model_name_or_path, **kwargs)
@@ -169,6 +159,8 @@ class LanguageModel(nn.Module):
                 f"Transformers' model. Here's a list of available models: "
                 f"https://farm.deepset.ai/api/modeling.html#farm.modeling.language_model.LanguageModel.load"
             )
+        else:
+            logger.info(f"Loaded {pretrained_model_name_or_path}")
 
         # resize embeddings in case of custom vocab
         if n_added_tokens != 0:
@@ -183,6 +175,84 @@ class LanguageModel(nn.Module):
             assert vocab_size == model_emb_size
 
         return language_model
+
+    @staticmethod
+    def get_language_model_class(model_name_or_path):
+        # it's transformers format (either from model hub or local)
+        model_name_or_path = str(model_name_or_path)
+
+        config = AutoConfig.from_pretrained(model_name_or_path)
+        model_type = config.model_type
+        if model_type == "xlm-roberta":
+            language_model_class = "XLMRoberta"
+        elif model_type == "roberta":
+            if "mlm" in model_name_or_path.lower():
+                raise NotImplementedError("MLM part of codebert is currently not supported in FARM")
+            language_model_class = "Roberta"
+        elif model_type == "camembert":
+            language_model_class = "Camembert"
+        elif model_type == "albert":
+            language_model_class = "Albert"
+        elif model_type == "distilbert":
+            language_model_class = "DistilBert"
+        elif model_type == "bert":
+            language_model_class = "Bert"
+        elif model_type == "xlnet":
+            language_model_class = "XLNet"
+        elif model_type == "electra":
+            language_model_class = "Electra"
+        elif model_type == "dpr":
+            if config.architectures[0] == "DPRQuestionEncoder":
+                language_model_class = "DPRQuestionEncoder"
+            elif config.architectures[0] == "DPRContextEncoder":
+                language_model_class = "DPRContextEncoder"
+            elif config.archictectures[0] == "DPRReader":
+                raise NotImplementedError("DPRReader models are currently not supported.")
+        else:
+            # Fall back to inferring type from model name
+            logger.warning("Could not infer LanguageModel class from config. Trying to infer "
+                           "LanguageModel class from model name.")
+            language_model_class = LanguageModel._infer_language_model_class_from_string(model_name_or_path)
+
+        return language_model_class
+
+    @staticmethod
+    def _infer_language_model_class_from_string(model_name_or_path):
+        # If inferring Language model class from config doesn't succeed,
+        # fall back to inferring Language model class from model name.
+        if "xlm" in model_name_or_path.lower() and "roberta" in model_name_or_path.lower():
+            language_model_class = "XLMRoberta"
+        elif "roberta" in model_name_or_path.lower():
+            language_model_class = "Roberta"
+        elif "codebert" in model_name_or_path.lower():
+            if "mlm" in model_name_or_path.lower():
+                raise NotImplementedError("MLM part of codebert is currently not supported in FARM")
+            else:
+                language_model_class = "Roberta"
+        elif "camembert" in model_name_or_path.lower() or "umberto" in model_name_or_path.lower():
+            language_model_class = "Camembert"
+        elif "albert" in model_name_or_path.lower():
+            language_model_class = 'Albert'
+        elif "distilbert" in model_name_or_path.lower():
+            language_model_class = 'DistilBert'
+        elif "bert" in model_name_or_path.lower():
+            language_model_class = 'Bert'
+        elif "xlnet" in model_name_or_path.lower():
+            language_model_class = 'XLNet'
+        elif "electra" in model_name_or_path.lower():
+            language_model_class = 'Electra'
+        elif "word2vec" in model_name_or_path.lower() or "glove" in model_name_or_path.lower():
+            language_model_class = 'WordEmbedding_LM'
+        elif "minilm" in model_name_or_path.lower():
+            language_model_class = "Bert"
+        elif "dpr-question_encoder" in model_name_or_path.lower():
+            language_model_class = "DPRQuestionEncoder"
+        elif "dpr-ctx_encoder" in model_name_or_path.lower():
+            language_model_class = "DPRContextEncoder"
+        else:
+            language_model_class = None
+
+        return language_model_class
 
     def get_output_dims(self):
         config = self.model.config
@@ -255,18 +325,7 @@ class LanguageModel(nn.Module):
             )
         elif len(matches) == 0:
             language = "english"
-            logger.warning(
-                "Could not automatically detect from language model name what language it is. \n"
-                "\t We guess it's an *ENGLISH* model ... \n"
-                "\t If not: Init the language model by supplying the 'language' param."
-            )
         elif len(matches) > 1:
-            logger.warning(
-                "Could not automatically detect from language model name what language it is.\n"
-                f"\t Found multiple matches: {matches}\n"
-                "\t Please init the language model by manually supplying the 'language' as a parameter.\n"
-                f"\t Using {matches[0]} as language parameter for now.\n"
-            )
             language = matches[0]
         else:
             language = matches[0]
@@ -327,7 +386,7 @@ class LanguageModel(nn.Module):
         preds = []
         for vec, sample in zip(vecs, samples):
             pred = {}
-            pred["context"] = sample.tokenized["tokens"]
+            pred["context"] = sample.clear_text["text"]
             pred["vec"] = vec
             preds.append(pred)
         return preds
@@ -757,7 +816,7 @@ class DistilBert(LanguageModel):
         farm_lm_config = Path(pretrained_model_name_or_path) / "language_model_config.json"
         if os.path.exists(farm_lm_config):
             # FARM style
-            config = AlbertConfig.from_pretrained(farm_lm_config)
+            config = DistilBertConfig.from_pretrained(farm_lm_config)
             farm_lm_model = Path(pretrained_model_name_or_path) / "language_model.bin"
             distilbert.model = DistilBertModel.from_pretrained(farm_lm_model, config=config, **kwargs)
             distilbert.language = distilbert.model.config.language
@@ -1260,6 +1319,7 @@ class Electra(LanguageModel):
         config.summary_last_dropout = 0
         config.summary_type = 'first'
         config.summary_activation = 'gelu'
+        config.summary_use_proj = False
         electra.pooler = SequenceSummary(config)
         electra.pooler.apply(electra.model._init_weights)
         return electra
@@ -1347,3 +1407,210 @@ class Camembert(Roberta):
             camembert.model = CamembertModel.from_pretrained(str(pretrained_model_name_or_path), **kwargs)
             camembert.language = cls._get_or_infer_language_from_name(language, pretrained_model_name_or_path)
         return camembert
+
+
+class DPRQuestionEncoder(LanguageModel):
+    """
+    A DPRQuestionEncoder model that wraps HuggingFace's implementation
+    """
+
+    def __init__(self):
+        super(DPRQuestionEncoder, self).__init__()
+        self.model = None
+        self.name = "dpr_question_encoder"
+
+    @classmethod
+    def load(cls, pretrained_model_name_or_path, language=None, **kwargs):
+        """
+        Load a pretrained model by supplying
+
+        * the name of a remote model on s3 ("facebook/dpr-question_encoder-single-nq-base" ...)
+        * OR a local path of a model trained via transformers ("some_dir/huggingface_model")
+        * OR a local path of a model trained via FARM ("some_dir/farm_model")
+
+        :param pretrained_model_name_or_path: The path of the base pretrained language model whose weights are used to initialize DPRQuestionEncoder
+        :type pretrained_model_name_or_path: str
+        """
+
+        dpr_question_encoder = cls()
+        if "farm_lm_name" in kwargs:
+            dpr_question_encoder.name = kwargs["farm_lm_name"]
+        else:
+            dpr_question_encoder.name = pretrained_model_name_or_path
+
+        # We need to differentiate between loading model using FARM format and Pytorch-Transformers format
+        farm_lm_config = Path(pretrained_model_name_or_path) / "language_model_config.json"
+        if os.path.exists(farm_lm_config):
+            # FARM style
+            dpr_config = transformers.DPRConfig.from_pretrained(farm_lm_config)
+            farm_lm_model = Path(pretrained_model_name_or_path) / "language_model.bin"
+            dpr_question_encoder.model = transformers.DPRQuestionEncoder.from_pretrained(farm_lm_model, config=dpr_config, **kwargs)
+            dpr_question_encoder.language = dpr_question_encoder.model.config.language
+        else:
+            original_model_config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+            if original_model_config.model_type == "dpr":
+                # "pretrained dpr model": load existing pretrained DPRQuestionEncoder model
+                dpr_question_encoder.model = transformers.DPRQuestionEncoder.from_pretrained(
+                    str(pretrained_model_name_or_path), **kwargs)
+            else:
+                # "from scratch": load weights from different architecture (e.g. bert) into DPRQuestionEncoder
+                # but keep config values from original architecture
+                # TODO test for architectures other than BERT, e.g. Electra
+                if original_model_config.model_type != "bert":
+                    logger.warning(f"Using a model of type '{original_model_config.model_type}' which might be incompatible with DPR encoders."
+                                   f"Bert based encoders are supported that need input_ids,token_type_ids,attention_mask as input tensors.")
+                original_config_dict = vars(original_model_config)
+                original_config_dict.update(kwargs)
+                dpr_question_encoder.model = transformers.DPRQuestionEncoder(config=transformers.DPRConfig(**original_config_dict))
+                dpr_question_encoder.model.base_model.bert_model = AutoModel.from_pretrained(
+                    str(pretrained_model_name_or_path), **original_config_dict)
+            dpr_question_encoder.language = cls._get_or_infer_language_from_name(language, pretrained_model_name_or_path)
+
+        return dpr_question_encoder
+
+    def forward(
+        self,
+        query_input_ids,
+        query_segment_ids,
+        query_attention_mask,
+        **kwargs,
+    ):
+        """
+        Perform the forward pass of the DPRQuestionEncoder model.
+
+        :param query_input_ids: The ids of each token in the input sequence. Is a tensor of shape [batch_size, max_seq_len]
+        :type query_input_ids: torch.Tensor
+        :param query_segment_ids: The id of the segment. For example, in next sentence prediction, the tokens in the
+           first sentence are marked with 0 and those in the second are marked with 1.
+           It is a tensor of shape [batch_size, max_seq_len]
+        :type query_segment_ids: torch.Tensor
+        :param query_attention_mask: A mask that assigns a 1 to valid input tokens and 0 to padding tokens
+           of shape [batch_size, max_seq_len]
+        :type query_attention_mask: torch.Tensor
+        :return: Embeddings for each token in the input sequence.
+
+        """
+        output_tuple = self.model(
+            input_ids=query_input_ids,
+            token_type_ids=query_segment_ids,
+            attention_mask=query_attention_mask,
+            return_dict=True
+        )
+        if self.model.question_encoder.config.output_hidden_states == True:
+            pooled_output, all_hidden_states = output_tuple.pooler_output, output_tuple.hidden_states
+            return pooled_output, all_hidden_states
+        else:
+            pooled_output = output_tuple.pooler_output
+            return pooled_output, None
+
+    def enable_hidden_states_output(self):
+        self.model.question_encoder.config.output_hidden_states = True
+
+    def disable_hidden_states_output(self):
+        self.model.question_encoder.config.output_hidden_states = False
+
+
+class DPRContextEncoder(LanguageModel):
+    """
+    A DPRContextEncoder model that wraps HuggingFace's implementation
+    """
+
+    def __init__(self):
+        super(DPRContextEncoder, self).__init__()
+        self.model = None
+        self.name = "dpr_context_encoder"
+
+    @classmethod
+    def load(cls, pretrained_model_name_or_path, language=None, **kwargs):
+        """
+        Load a pretrained model by supplying
+
+        * the name of a remote model on s3 ("facebook/dpr-ctx_encoder-single-nq-base" ...)
+        * OR a local path of a model trained via transformers ("some_dir/huggingface_model")
+        * OR a local path of a model trained via FARM ("some_dir/farm_model")
+
+        :param pretrained_model_name_or_path: The path of the base pretrained language model whose weights are used to initialize DPRContextEncoder
+        :type pretrained_model_name_or_path: str
+        """
+
+        dpr_context_encoder = cls()
+        if "farm_lm_name" in kwargs:
+            dpr_context_encoder.name = kwargs["farm_lm_name"]
+        else:
+            dpr_context_encoder.name = pretrained_model_name_or_path
+        # We need to differentiate between loading model using FARM format and Pytorch-Transformers format
+        farm_lm_config = Path(pretrained_model_name_or_path) / "language_model_config.json"
+        if os.path.exists(farm_lm_config):
+            # FARM style
+            dpr_config = transformers.DPRConfig.from_pretrained(farm_lm_config)
+            farm_lm_model = Path(pretrained_model_name_or_path) / "language_model.bin"
+            dpr_context_encoder.model = transformers.DPRContextEncoder.from_pretrained(farm_lm_model, config=dpr_config, **kwargs)
+            dpr_context_encoder.language = dpr_context_encoder.model.config.language
+        else:
+            # Pytorch-transformer Style
+            original_model_config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+            if original_model_config.model_type == "dpr":
+                # "pretrained dpr model": load existing pretrained DPRContextEncoder model
+                dpr_context_encoder.model = transformers.DPRContextEncoder.from_pretrained(
+                    str(pretrained_model_name_or_path), **kwargs)
+            else:
+                # "from scratch": load weights from different architecture (e.g. bert) into DPRContextEncoder
+                # but keep config values from original architecture
+                # TODO test for architectures other than BERT, e.g. Electra
+                if original_model_config.model_type != "bert":
+                    logger.warning(
+                        f"Using a model of type '{original_model_config.model_type}' which might be incompatible with DPR encoders."
+                        f"Bert based encoders are supported that need input_ids,token_type_ids,attention_mask as input tensors.")
+                original_config_dict = vars(original_model_config)
+                original_config_dict.update(kwargs)
+                dpr_context_encoder.model = transformers.DPRContextEncoder(
+                    config=transformers.DPRConfig(**original_config_dict))
+                dpr_context_encoder.model.base_model.bert_model = AutoModel.from_pretrained(
+                    str(pretrained_model_name_or_path), **original_config_dict)
+            dpr_context_encoder.language = cls._get_or_infer_language_from_name(language, pretrained_model_name_or_path)
+
+        return dpr_context_encoder
+
+    def forward(
+        self,
+        passage_input_ids,
+        passage_segment_ids,
+        passage_attention_mask,
+        **kwargs,
+    ):
+        """
+        Perform the forward pass of the DPRContextEncoder model.
+
+        :param passage_input_ids: The ids of each token in the input sequence. Is a tensor of shape [batch_size, number_of_hard_negative_passages, max_seq_len]
+        :type passage_input_ids: torch.Tensor
+        :param passage_segment_ids: The id of the segment. For example, in next sentence prediction, the tokens in the
+           first sentence are marked with 0 and those in the second are marked with 1.
+           It is a tensor of shape [batch_size, number_of_hard_negative_passages, max_seq_len]
+        :type passage_segment_ids: torch.Tensor
+        :param passage_attention_mask: A mask that assigns a 1 to valid input tokens and 0 to padding tokens
+           of shape [batch_size,  number_of_hard_negative_passages, max_seq_len]
+        :return: Embeddings for each token in the input sequence.
+
+        """
+        max_seq_len = passage_input_ids.shape[-1]
+        passage_input_ids = passage_input_ids.view(-1, max_seq_len)
+        passage_segment_ids = passage_segment_ids.view(-1, max_seq_len)
+        passage_attention_mask = passage_attention_mask.view(-1, max_seq_len)
+        output_tuple = self.model(
+            input_ids=passage_input_ids,
+            token_type_ids=passage_segment_ids,
+            attention_mask=passage_attention_mask,
+            return_dict=True
+        )
+        if self.model.ctx_encoder.config.output_hidden_states == True:
+            pooled_output, all_hidden_states = output_tuple.pooler_output, output_tuple.hidden_states
+            return pooled_output, all_hidden_states
+        else:
+            pooled_output = output_tuple.pooler_output
+            return pooled_output, None
+
+    def enable_hidden_states_output(self):
+        self.model.ctx_encoder.config.output_hidden_states = True
+
+    def disable_hidden_states_output(self):
+        self.model.ctx_encoder.config.output_hidden_states = False

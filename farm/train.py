@@ -13,6 +13,7 @@ from farm.eval import Evaluator
 from farm.data_handler.data_silo import DataSilo
 from farm.visual.ascii.images import GROWING_TREE
 from farm.modeling.adaptive_model import AdaptiveModel
+from farm.modeling.biadaptive_model import BiAdaptiveModel
 from farm.modeling.optimization import get_scheduler
 
 try:
@@ -32,6 +33,7 @@ class EarlyStopping:
 
     def __init__(
             self,
+            head=0,
             metric="loss",
             save_dir=None,
             mode="min",
@@ -40,6 +42,7 @@ class EarlyStopping:
             min_evals=0,
     ):
         """
+        :param head: the prediction head referenced by the metric.
         :param save_dir: the directory where to save the final best model, if None, no saving.
         :param metric: name of dev set metric to monitor (default: loss) to get extracted from the 0th head or
                        a function that extracts a value from the trainer dev evaluation result.
@@ -52,7 +55,7 @@ class EarlyStopping:
         :param min_delta: minimum difference to a previous best value to count as an improvement.
         :param min_evals: minimum number of evaluations to wait before using eval value
         """
-
+        self.head = head
         self.metric = metric
         self.save_dir = save_dir
         self.mode = mode
@@ -79,13 +82,13 @@ class EarlyStopping:
         """
 
         if isinstance(self.metric, str):
-            eval_value = eval_result[0][self.metric]
+            eval_value = eval_result[self.head][self.metric]
         else:
             eval_value = self.metric(eval_result)
         self.eval_values.append(float(eval_value))
         stopprocessing, savemodel = False, False
         if len(self.eval_values) <= self.min_evals:
-            return stopprocessing, savemodel
+            return stopprocessing, savemodel, eval_value
         if self.mode == "min":
             delta = self.best_so_far - eval_value
         else:
@@ -247,8 +250,12 @@ class Trainer:
 
         # connect the prediction heads with the right output from processor
         self.model.connect_heads_with_processor(self.data_silo.processor.tasks, require_labels=True)
-        # Check that the tokenizer fits the language model
-        self.model.verify_vocab_size(vocab_size=len(self.data_silo.processor.tokenizer))
+        # Check that the tokenizer(s) fits the language model(s)
+        if hasattr(self.model, "language_model2"):
+            self.model.verify_vocab_size(vocab_size1=len(self.data_silo.processor.query_tokenizer),
+                                         vocab_size2=len(self.data_silo.processor.passage_tokenizer))
+        else:
+            self.model.verify_vocab_size(vocab_size=len(self.data_silo.processor.tokenizer))
         self.model.train()
 
         do_stopping = False
@@ -289,7 +296,6 @@ class Trainer:
 
                 # Move batch of samples to device
                 batch = {key: batch[key].to(self.device) for key in batch}
-
                 # Forward & backward pass through model
                 logits = self.model.forward(**batch)
                 per_sample_loss = self.model.logits_to_loss(logits=logits, global_step=self.global_step, **batch)
@@ -359,7 +365,7 @@ class Trainer:
             self.model.connect_heads_with_processor(self.data_silo.processor.tasks, require_labels=True)
 
         # Eval on test set
-        if self.evaluator_test:
+        if self.evaluator_test and self.local_rank in [0, -1]:
             test_data_loader = self.data_silo.get_data_loader("test")
             if test_data_loader is not None:
                 evaluator_test = Evaluator(

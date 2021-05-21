@@ -81,13 +81,18 @@ def test_lm_finetuning(caplog):
     model.save(save_dir)
     processor.save(save_dir)
 
+    del model
+    del processor
+    del optimizer
+    del data_silo
+    del trainer
+
     basic_texts = [
         {"text": "Farmer's life is great."},
         {"text": "It's nothing for big city kids though."},
     ]
     model = Inferencer.load(save_dir, task_type="embeddings", num_processes=0)
     result = model.extract_vectors(dicts=basic_texts)
-    assert result[0]["context"] == ['Farmer', "'", 's', 'life', 'is', 'great', '.']
     assert result[0]["vec"].shape == (768,)
     # TODO check why results vary accross runs with same seed
     assert isinstance(result[0]["vec"][0], np.float32)
@@ -159,13 +164,18 @@ def test_lm_finetuning_no_next_sentence(caplog):
     model.save(save_dir)
     processor.save(save_dir)
 
+    del model
+    del processor
+    del optimizer
+    del data_silo
+    del trainer
+
     basic_texts = [
         {"text": "Farmer's life is great."},
         {"text": "It's nothing for big city kids though."},
     ]
     model = Inferencer.load(save_dir, task_type="embeddings", num_processes=0)
     result = model.extract_vectors(dicts=basic_texts)
-    assert result[0]["context"] == ['Farmer', "'", 's', 'life', 'is', 'great', '.']
     assert result[0]["vec"].shape == (768,)
     # TODO check why results vary accross runs with same seed
     assert isinstance(result[0]["vec"][0], np.float32)
@@ -197,8 +207,8 @@ def test_lm_finetuning_custom_vocab(caplog):
     )
     data_silo = DataSilo(processor=processor, batch_size=batch_size, max_processes=1)
 
-    language_model = LanguageModel.load(lang_model, n_added_tokens=len(tokenizer.added_tokens_decoder))
-    lm_prediction_head = BertLMHead.load(lang_model, n_added_tokens=len(tokenizer.added_tokens_decoder))
+    language_model = LanguageModel.load(lang_model, n_added_tokens=len(tokenizer.get_added_vocab()))
+    lm_prediction_head = BertLMHead.load(lang_model, n_added_tokens=len(tokenizer.get_added_vocab()))
     next_sentence_head = NextSentenceHead.load(lang_model)
 
     model = AdaptiveModel(
@@ -239,13 +249,18 @@ def test_lm_finetuning_custom_vocab(caplog):
     model.save(save_dir)
     processor.save(save_dir)
 
+    del model
+    del processor
+    del optimizer
+    del data_silo
+    del trainer
+
     basic_texts = [
         {"text": "Farmer's life is great."},
         {"text": "It's nothing for big city kids though."},
     ]
     model = Inferencer.load(save_dir, task_type="embeddings", num_processes=0)
     result = model.extract_vectors(dicts=basic_texts)
-    assert result[0]["context"] == ['Farmer', "'", 's', 'life', 'is', 'great', '.']
     assert result[0]["vec"].shape == (768,)
     # TODO check why results vary accross runs with same seed
     assert isinstance(result[0]["vec"][0], np.float32)

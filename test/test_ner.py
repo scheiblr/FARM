@@ -16,8 +16,8 @@ from farm.utils import set_all_seeds, initialize_device_settings
 
 import logging
 
-
-@pytest.mark.parametrize("use_fast", [False, True])
+# TODO: Test slow tokenizers when reimplemented
+@pytest.mark.parametrize("use_fast", [True])
 def test_ner(caplog, use_fast):
     if caplog:
         caplog.set_level(logging.CRITICAL)
@@ -46,7 +46,8 @@ def test_ner(caplog, use_fast):
         test_filename=None,
         delimiter=" ",
         label_list=ner_labels,
-        metric="seq_f1"
+        metric="seq_f1",
+        multithreading_rust=False
     )
 
     data_silo = DataSilo(processor=processor, batch_size=batch_size, max_processes=1)
@@ -86,6 +87,12 @@ def test_ner(caplog, use_fast):
     model.save(save_dir)
     processor.save(save_dir)
 
+    del model
+    del processor
+    del optimizer
+    del data_silo
+    del trainer
+
     basic_texts = [
         {"text": "Paris is a town in France."},
     ]
@@ -96,8 +103,10 @@ def test_ner(caplog, use_fast):
     model.processor.tasks["ner"]["label_list"][-1] = "B-LOC"
     result = model.inference_from_dicts(dicts=basic_texts)
 
-    assert result[0]["predictions"][0]["context"] == "Paris"
-    assert isinstance(result[0]["predictions"][0]["probability"], np.float32)
+    assert result[0]["predictions"][0][0]["context"] == "Paris"
+    assert isinstance(result[0]["predictions"][0][0]["probability"], np.float32)
+    assert result[0]["predictions"][0][0]["probability"] > 0.99
+    assert result[0]["predictions"][0][0]["label"] == "LOC"
 
 
 if __name__ == "__main__":
